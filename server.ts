@@ -465,19 +465,128 @@ async function scoreAndSummarize(
   return null;
 }
 
+// 清理原文 HTML，为翻译准备干净的文本
+function cleanContentForTranslation(html: string): string {
+  return html
+    // 保留代码块结构
+    .replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, '\n```\n$1\n```\n')
+    .replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, '`$1`')
+    // 块级元素转换为换行
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/div>/gi, '\n')
+    .replace(/<\/li>/gi, '\n')
+    .replace(/<\/tr>/gi, '\n')
+    .replace(/<\/h[1-6]>/gi, '\n\n')
+    .replace(/<hr\s*\/?>/gi, '\n---\n')
+    // 移除所有其他标签
+    .replace(/<[^>]+>/g, '')
+    // HTML 实体解码
+    .replace(/&/g, '&')
+    .replace(/</g, '<')
+    .replace(/>/g, '>')
+    .replace(/"/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/'/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
+    // 清理空白
+    .replace(/\r\n/g, '\n')
+    .replace(/\t/g, ' ')
+    .replace(/ +/g, ' ')
+    .replace(/\n /g, '\n')
+    .replace(/ \n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+// 从网页 URL 抓取文章正文内容
+async function fetchArticleContent(url: string): Promise<string> {
+  try {
+    log(`🌐 抓取网页内容: ${url}`);
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      },
+    });
+    
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    
+    const html = await res.text();
+    
+    // 尝试提取正文内容
+    let content = "";
+    
+    // 优先提取 <article> 标签
+    const articleMatch = html.match(/<article[^>]*>([\s\S]*?)<\/article>/i);
+    if (articleMatch) {
+      content = articleMatch[1];
+    }
+    
+    // 尝试 <main> 标签
+    if (!content || content.length < 500) {
+      const mainMatch = html.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
+      if (mainMatch && mainMatch[1].length > content.length) {
+        content = mainMatch[1];
+      }
+    }
+    
+    // 尝试常见的内容容器
+    if (!content || content.length < 500) {
+      const contentPatterns = [
+        /<div[^>]*class="[^"]*(?:post-content|article-content|entry-content|content-body|post-body|article-body)[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
+        /<div[^>]*id="[^"]*(?:content|article|post|main)[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
+      ];
+      for (const pattern of contentPatterns) {
+        const match = html.match(pattern);
+        if (match && match[1].length > (content?.length || 0)) {
+          content = match[1];
+        }
+      }
+    }
+    
+    // 最后尝试 <body>
+    if (!content || content.length < 500) {
+      const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+      if (bodyMatch) {
+        // 移除脚本、样式、导航等
+        content = bodyMatch[1]
+          .replace(/<script[\s\S]*?<\/script>/gi, '')
+          .replace(/<style[\s\S]*?<\/style>/gi, '')
+          .replace(/<nav[\s\S]*?<\/nav>/gi, '')
+          .replace(/<header[\s\S]*?<\/header>/gi, '')
+          .replace(/<footer[\s\S]*?<\/footer>/gi, '')
+          .replace(/<aside[\s\S]*?<\/aside>/gi, '')
+          .replace(/<!--[\s\S]*?-->/g, '');
+      }
+    }
+    
+    // 清理并转换为文本
+    const cleanedContent = cleanContentForTranslation(content);
+    log(`🌐 抓取完成，内容长度: ${cleanedContent.length}`);
+    
+    return cleanedContent;
+  } catch (e) {
+    logError(`🌐 网页抓取失败: ${(e as Error).message}`);
+    return "";
+  }
+}
+
 async function translateFullText(config: Config, content: string): Promise<string> {
-  const prompt = `将以下英文技术文章翻译成流畅的中文，保持技术术语准确：
-
-${content.slice(0, 15000)}
-
-直接返回翻译结果，不要添加额外说明。`;
-
-  // 翻译全文需要更长的超时时间，使用配置超时的 2 倍（最少 120 秒）
+  // 先清理 HTML，得到干净的文本
+  const cleanContent = cleanContentForTranslation(content);
+  log(`📄 原文长度: ${content.length}, 清理后: ${cleanContent.length}`);
+  
+  // 支持更长内容翻译（分段处理超长文章）
+  const maxChunk = 25000;  // 留出 prompt 空间
   const settings = config.llmSettings || DEFAULT_CONFIG.llmSettings;
   const baseTimeout = settings.timeout || 60000;
-  const translateTimeout = Math.max(baseTimeout * 2, 120000);
-  
-  // 创建一个临时的 config，使用更长的超时
+  const translateTimeout = Math.max(baseTimeout * 3, 180000);
+
   const translateConfig: Config = {
     ...config,
     llmSettings: {
@@ -485,9 +594,48 @@ ${content.slice(0, 15000)}
       timeout: translateTimeout,
     },
   };
+
+  const translatePrompt = (text: string) => `将以下英文技术文章翻译成流畅的中文。要求：
+1. 保持技术术语准确
+2. 保留代码块格式
+3. 直接返回翻译结果，不要添加任何说明或前缀
+
+${text}`;
+
+  // 如果内容不太长，直接翻译
+  if (cleanContent.length <= maxChunk) {
+    return await callLLM(translateConfig, translatePrompt(cleanContent));
+  }
+
+  // 超长内容分段翻译
+  log(`📄 文章较长(${cleanContent.length}字符)，分段翻译...`);
+  const parts: string[] = [];
+  let remaining = cleanContent;
+  let partNum = 1;
   
-  log(`⏱️ 翻译超时设置: ${translateTimeout / 1000}秒`);
-  return await callLLM(translateConfig, prompt);
+  while (remaining.length > 0) {
+    let chunk: string;
+    if (remaining.length <= maxChunk) {
+      chunk = remaining;
+      remaining = "";
+    } else {
+      // 尝试在段落处分割
+      let splitPos = remaining.lastIndexOf('\n\n', maxChunk);
+      if (splitPos < maxChunk / 2) splitPos = remaining.lastIndexOf('. ', maxChunk);
+      if (splitPos < maxChunk / 2) splitPos = remaining.lastIndexOf('\n', maxChunk);
+      if (splitPos < maxChunk / 2) splitPos = maxChunk;
+      chunk = remaining.slice(0, splitPos);
+      remaining = remaining.slice(splitPos).trim();
+    }
+    
+    log(`📄 翻译第 ${partNum} 部分 (${chunk.length} 字符)...`);
+    const translated = await callLLM(translateConfig, translatePrompt(chunk));
+    parts.push(translated);
+    partNum++;
+  }
+  
+  log(`📄 分段翻译完成，共 ${parts.length} 部分`);
+  return parts.join('\n\n');
 }
 
 // ============ Telegram ============
@@ -520,70 +668,33 @@ async function sendTelegram(
   }
 }
 
-async function editTelegramMessage(
-  config: Config,
-  messageId: number,
-  text: string,
-  replyMarkup?: any
-): Promise<boolean> {
-  if (!config.telegram.enabled || !config.telegram.botToken) return false;
-
-  try {
-    await fetch(
-      `https://api.telegram.org/bot${config.telegram.botToken}/editMessageText`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: config.telegram.chatId,
-          message_id: messageId,
-          text,
-          parse_mode: "HTML",
-          reply_markup: replyMarkup,
-        }),
-      }
-    );
-    return true;
-  } catch (e) {
-    logError("Telegram edit error: " + (e as Error).message);
-    return false;
-  }
-}
-
 function formatSummaryMessage(article: Article): { text: string; markup: any } {
   const categoryEmoji: Record<string, string> = {
-    engineering: "⚙️ 工程",
-    ai: "🤖 AI",
-    tools: "🛠️ 工具",
-    other: "📰 资讯",
+    engineering: "⚙️",
+    ai: "🤖",
+    tools: "🛠️",
+    other: "📰",
   };
 
-  // 评分星级显示
-  const scoreStars = "★".repeat(Math.round(article.score / 2)) + "☆".repeat(5 - Math.round(article.score / 2));
+  const stars = "★".repeat(Math.round(article.score / 2)) + "☆".repeat(5 - Math.round(article.score / 2));
+  const emoji = categoryEmoji[article.category] || "📰";
   
-  // 消息格式 - 标题完整显示不截断
-  const text = `┏━━━━━━━━━━━━━━━━━━━━┓
-┃ ${categoryEmoji[article.category] || "📰 资讯"}  ${scoreStars} <b>${article.score}</b>/10
-┗━━━━━━━━━━━━━━━━━━━━┛
-
-<b>📌 ${article.titleZh}</b>
+  // 手机端优化格式 - 标题突出显示
+  const text = `${emoji} <b>${article.titleZh}</b>
 <i>${article.title}</i>
+${stars} ${article.score}/10
 
-━━━ 📝 摘要 ━━━
 ${article.summary}
 
-━━━ 💡 推荐理由 ━━━
-${article.reason}
+💡 ${article.reason}
 
-🏷️ <code>${article.keywords.join(" · ")}</code>`;
+#${article.keywords.slice(0, 4).join(" #")}`;
 
   const markup = {
     inline_keyboard: [
       [
-        { text: "📖 阅读中文全文", callback_data: `read_${article.id}` },
-      ],
-      [
-        { text: "🔗 原文链接", url: article.link },
+        { text: "📖 中文全文", callback_data: `read_${article.id}` },
+        { text: "🔗 原文", url: article.link },
       ],
     ],
   };
@@ -626,38 +737,93 @@ function splitLongText(text: string, maxLen: number = 4000): string[] {
   return parts;
 }
 
+// 清理 HTML 标签，转换为纯文本
+function sanitizeHtml(text: string): string {
+  return text
+    // 先处理块级标签，转换为换行
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/div>/gi, '\n')
+    .replace(/<\/li>/gi, '\n')
+    .replace(/<\/tr>/gi, '\n')
+    .replace(/<\/h[1-6]>/gi, '\n\n')
+    .replace(/<hr\s*\/?>/gi, '\n───\n')
+    // 移除所有其他 HTML 标签
+    .replace(/<[^>]+>/g, '')
+    // HTML 实体解码（顺序很重要：& 必须最先处理）
+    .replace(/&/g, '&')
+    .replace(/</g, '<')
+    .replace(/>/g, '>')
+    .replace(/"/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/'/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
+    // 清理多余空白
+    .replace(/\r\n/g, '\n')
+    .replace(/\t/g, ' ')
+    .replace(/ +/g, ' ')
+    .replace(/\n /g, '\n')
+    .replace(/ \n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 // 格式化全文消息 - 返回多条消息（支持长文分段）
+// chatInfo 可选，用于生成直接跳转的返回摘要按钮
 function formatFullTextMessages(
-  article: Article
+  article: Article,
+  chatInfo?: { username?: string; type?: string; id?: number | string }
 ): { texts: string[]; markup: any } {
-  const content = article.translatedContent || "翻译中...";
+  const rawContent = article.translatedContent || "翻译中...";
   
-  // 格式化内容 - 添加段落间距
+  // 清理 HTML 并格式化内容
+  const content = sanitizeHtml(rawContent);
   const formattedContent = content
     .split('\n\n')
     .map(p => p.trim())
     .filter(p => p)
     .join('\n\n');
 
-  // 头部消息
-  const header = `┏━━━━━━━━━━━━━━━━━━━━┓
-┃ 📖 <b>全文翻译</b>
-┗━━━━━━━━━━━━━━━━━━━━┛
+  // 头部 - 简洁紧凑
+  const header = `📖 <b>${article.titleZh}</b>
+<i>${article.title}</i>
 
-<b>${article.titleZh}</b>
+───────────────`;
 
-━━━━━━━━━━━━━━━━━━━━`;
+  // 尾部 - 简洁
+  const tags = article.keywords?.slice(0, 4).map(k => `#${k}`).join(" ") || "";
+  const footer = `───────────────
+${tags}`;
 
-  // 尾部
-  const footer = `━━━━━━━━━━━━━━━━━━━━
-🏷️ <code>${article.keywords?.join(" · ") || ""}</code>`;
+  // 构建按钮 - 单行显示
+  const inlineKeyboard: any[][] = [];
+  const buttons: any[] = [];
+  
+  // 返回摘要按钮 - 尝试生成直接跳转 URL
+  if (article.summaryMsgId && chatInfo) {
+    let jumpUrl = "";
+    if (chatInfo.username) {
+      jumpUrl = `https://t.me/${chatInfo.username}/${article.summaryMsgId}`;
+    } else if ((chatInfo.type === "supergroup" || chatInfo.type === "channel") && chatInfo.id) {
+      const shortChatId = String(chatInfo.id).replace(/^-100/, "");
+      jumpUrl = `https://t.me/c/${shortChatId}/${article.summaryMsgId}`;
+    }
+    if (jumpUrl) {
+      buttons.push({ text: "↩️ 返回", url: jumpUrl });
+    }
+  }
+  
+  buttons.push({ text: "🔗 原文", url: article.link });
+  inlineKeyboard.push(buttons);
+  const finalMarkup = { inline_keyboard: inlineKeyboard };
 
   // 检查是否需要分段
   const fullText = `${header}\n\n${formattedContent}\n\n${footer}`;
   
   if (fullText.length <= 4000) {
-    // 不需要分段
-    return { texts: [fullText], markup: null };
+    return { texts: [fullText], markup: finalMarkup };
   }
   
   // 需要分段发送
@@ -665,11 +831,11 @@ function formatFullTextMessages(
   const texts: string[] = [];
   
   // 第一条：标题 + 第一部分内容
-  texts.push(`${header}\n\n${contentParts[0]}${contentParts.length > 1 ? '\n\n<i>📄 第 1/${contentParts.length} 部分</i>' : ''}`);
+  texts.push(`${header}\n\n${contentParts[0]}${contentParts.length > 1 ? '\n\n<i>[ 1/${contentParts.length} ]</i>' : ''}`);
   
   // 中间部分
   for (let i = 1; i < contentParts.length - 1; i++) {
-    texts.push(`${contentParts[i]}\n\n<i>📄 第 ${i + 1}/${contentParts.length} 部分</i>`);
+    texts.push(`${contentParts[i]}\n\n<i>[ ${i + 1}/${contentParts.length} ]</i>`);
   }
   
   // 最后一条：最后部分 + 尾部
@@ -677,22 +843,7 @@ function formatFullTextMessages(
     texts.push(`${contentParts[contentParts.length - 1]}\n\n${footer}`);
   }
 
-  // 按钮只在最后一条消息显示
-  const inlineKeyboard: any[][] = [];
-  
-  // 如果有摘要消息 ID，添加返回按钮（使用消息链接直接跳转）
-  if (article.summaryMsgId) {
-    // 使用 callback 让后端返回跳转链接
-    inlineKeyboard.push([
-      { text: "↩️ 返回摘要", callback_data: `back_${article.summaryMsgId}` }
-    ]);
-  }
-  
-  inlineKeyboard.push([{ text: "🔗 原文链接", url: article.link }]);
-  
-  const markup = { inline_keyboard: inlineKeyboard };
-
-  return { texts, markup };
+  return { texts, markup: finalMarkup };
 }
 
 // 保持旧函数兼容性（用于单条消息场景）
@@ -844,12 +995,69 @@ async function sendTelegramMessages(
   return lastMsgId;
 }
 
+// 发送消息到指定聊天（用于 webhook 回调）
+async function sendToChat(
+  botToken: string,
+  chatId: number | string,
+  text: string,
+  replyMarkup?: any
+): Promise<number | null> {
+  try {
+    const res = await fetch(
+      `https://api.telegram.org/bot${botToken}/sendMessage`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text,
+          parse_mode: "HTML",
+          reply_markup: replyMarkup,
+        }),
+      }
+    );
+    const data = await res.json();
+    if (!data.ok) {
+      logError(`Telegram sendToChat 失败: ${JSON.stringify(data)}`);
+    }
+    return data.result?.message_id || null;
+  } catch (e) {
+    logError("Telegram sendToChat error: " + (e as Error).message);
+    return null;
+  }
+}
+
+// 发送多条消息到指定聊天
+async function sendMultipleToChat(
+  botToken: string,
+  chatId: number | string,
+  texts: string[],
+  finalMarkup?: any
+): Promise<number | null> {
+  let lastMsgId: number | null = null;
+  
+  for (let i = 0; i < texts.length; i++) {
+    const isLast = i === texts.length - 1;
+    const markup = isLast ? finalMarkup : undefined;
+    
+    lastMsgId = await sendToChat(botToken, chatId, texts[i], markup);
+    
+    if (!isLast) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+  
+  return lastMsgId;
+}
+
 // ============ Telegram Webhook 处理 ============
 async function handleTelegramCallback(callbackQuery: any): Promise<void> {
   const config = loadJSON<Config>(CONFIG_FILE, DEFAULT_CONFIG);
   const articles = loadJSON<Record<string, Article>>(ARTICLES_FILE, {});
   const data = callbackQuery.data as string;
   const chatId = callbackQuery.message?.chat?.id;
+  
+  log(`📨 收到回调: data=${data}, chatId=${chatId}`);
 
   if (data.startsWith("read_")) {
     const articleId = data.replace("read_", "");
@@ -885,22 +1093,35 @@ async function handleTelegramCallback(callbackQuery: any): Promise<void> {
       }
     );
 
-    // 如果还没翻译，先翻译
-    if (!article.translatedContent) {
-      // 发送"翻译中"提示
-      const loadingMsg = `┏━━━━━━━━━━━━━━━━━━━━┓
-┃ 📖 <b>全文翻译</b>
-┗━━━━━━━━━━━━━━━━━━━━┛
-
-<b>${article.titleZh}</b>
-
-⏳ <i>正在翻译，请稍候...</i>`;
-      const loadingMsgId = await sendTelegram(config, loadingMsg);
+  // 如果还没翻译，先翻译
+  if (!article.translatedContent) {
+    // 发送"翻译中"提示 - 简洁格式
+    const loadingMsg = `⏳ <b>${article.titleZh}</b>\n\n正在翻译...`;
+    const loadingMsgId = await sendToChat(config.telegram.botToken, chatId, loadingMsg);
+      log(`📤 发送翻译中提示到 chatId=${chatId}, msgId=${loadingMsgId}`);
 
       // 翻译（带错误处理）
       try {
         log(`📖 开始翻译文章: ${article.titleZh}`);
-        article.translatedContent = await translateFullText(config, article.content);
+        
+        // 检查本地内容是否足够，不足则从网页抓取
+        let contentToTranslate = article.content;
+        const cleanedLocal = cleanContentForTranslation(contentToTranslate);
+        
+        if (cleanedLocal.length < 500) {
+          log(`📄 本地内容太短(${cleanedLocal.length}字符)，从原文链接抓取...`);
+          const fetchedContent = await fetchArticleContent(article.link);
+          if (fetchedContent.length > cleanedLocal.length) {
+            contentToTranslate = fetchedContent;
+            // 同时更新文章的 content 字段，下次不用重新抓取
+            article.content = fetchedContent;
+            log(`📄 抓取成功，内容长度: ${fetchedContent.length}`);
+          } else {
+            log(`📄 抓取内容仍然较短，使用本地内容`);
+          }
+        }
+        
+        article.translatedContent = await translateFullText(config, contentToTranslate);
         log(`✅ 翻译完成: ${article.titleZh}`);
         saveJSON(ARTICLES_FILE, articles);
       } catch (e: any) {
@@ -913,14 +1134,14 @@ async function handleTelegramCallback(callbackQuery: any): Promise<void> {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
-                chat_id: config.telegram.chatId,
+                chat_id: chatId,
                 message_id: loadingMsgId,
               }),
             }
           );
         }
-        // 发送错误提示
-        await sendTelegram(config, `❌ <b>翻译失败</b>\n\n${article.titleZh}\n\n原因: ${e.message}\n\n请稍后重试或检查 LLM 配置。`);
+        // 发送错误提示到回调消息所在的聊天
+        await sendToChat(config.telegram.botToken, chatId, `❌ <b>翻译失败</b>\n\n${article.titleZh}\n\n原因: ${e.message}\n\n请稍后重试或检查 LLM 配置。`);
         return;
       }
 
@@ -932,7 +1153,7 @@ async function handleTelegramCallback(callbackQuery: any): Promise<void> {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              chat_id: config.telegram.chatId,
+              chat_id: chatId,
               message_id: loadingMsgId,
             }),
           }
@@ -940,105 +1161,59 @@ async function handleTelegramCallback(callbackQuery: any): Promise<void> {
       }
     }
 
-    // 发送完整翻译（支持分段）
-    const { texts, markup } = formatFullTextMessages(article);
-    const lastMsgId = await sendTelegramMessages(config, texts, markup);
+    // 获取聊天信息用于生成返回摘要按钮
+    let chatInfo: { username?: string; type?: string; id?: number | string } | undefined;
+    try {
+      const chatInfoRes = await fetch(
+        `https://api.telegram.org/bot${config.telegram.botToken}/getChat`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chat_id: chatId }),
+        }
+      );
+      const chatInfoData = await chatInfoRes.json();
+      if (chatInfoData.ok) {
+        chatInfo = {
+          username: chatInfoData.result.username,
+          type: chatInfoData.result.type,
+          id: chatId,
+        };
+        log(`📋 获取聊天信息成功: username=${chatInfo.username}, type=${chatInfo.type}`);
+      }
+    } catch (e) {
+      logError("获取聊天信息失败: " + e);
+    }
+
+    // 发送完整翻译到回调消息所在的聊天（支持分段）
+    const { texts, markup } = formatFullTextMessages(article, chatInfo);
+    log(`📤 发送翻译全文到 chatId=${chatId}, 分段数=${texts.length}`);
+    const lastMsgId = await sendMultipleToChat(config.telegram.botToken, chatId, texts, markup);
+    log(`📤 翻译全文发送完成, lastMsgId=${lastMsgId}`);
     article.fullTextMsgId = lastMsgId;
     saveJSON(ARTICLES_FILE, articles);
     
   } else if (data.startsWith("back_")) {
+    // 返回摘要 - 直接应答提示用户向上滑动
+    // 注意：由于按钮已改为 url 类型，这个分支理论上不会被触发
+    // 保留作为兜底处理
     const msgId = parseInt(data.replace("back_", ""));
+    log(`↩️ 返回摘要请求（兜底）: msgId=${msgId}, chatId=${chatId}`);
     
-    if (msgId && chatId) {
-      // 尝试获取聊天信息来构建正确的链接
-      let jumpUrl = "";
-      let chatType = "";
-      
-      try {
-        const chatInfoRes = await fetch(
-          `https://api.telegram.org/bot${config.telegram.botToken}/getChat`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chat_id: chatId }),
-          }
-        );
-        const chatInfo = await chatInfoRes.json();
-        
-        if (chatInfo.ok) {
-          const chat = chatInfo.result;
-          chatType = chat.type;
-          
-          if (chat.username) {
-            // 公开群组/频道：t.me/username/msgId
-            jumpUrl = `https://t.me/${chat.username}/${msgId}`;
-          } else if (chat.type === "supergroup" || chat.type === "channel") {
-            // 私有超级群组/频道：t.me/c/chatId/msgId（chatId 需要去掉 -100 前缀）
-            const shortChatId = String(chatId).replace(/^-100/, "");
-            jumpUrl = `https://t.me/c/${shortChatId}/${msgId}`;
-          }
-          // 私聊 (chat.type === "private") 没有标准跳转链接
-        }
-        } catch (e) {
-        logError("获取聊天信息失败: " + e);
+    await fetch(
+      `https://api.telegram.org/bot${config.telegram.botToken}/answerCallbackQuery`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          callback_query_id: callbackQuery.id,
+          text: "↩️ 请向上滑动查找摘要消息",
+          show_alert: false,
+        }),
       }
-      
-      if (jumpUrl) {
-        // 使用 answerCallbackQuery 的 url 参数直接跳转
-        await fetch(
-          `https://api.telegram.org/bot${config.telegram.botToken}/answerCallbackQuery`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ 
-              callback_query_id: callbackQuery.id,
-              url: jumpUrl,
-            }),
-          }
-        );
-      } else if (chatType === "private") {
-        // 私聊：发送一条临时消息引导用户
-        await fetch(
-          `https://api.telegram.org/bot${config.telegram.botToken}/answerCallbackQuery`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ 
-              callback_query_id: callbackQuery.id,
-              text: `📍 摘要在第 ${msgId} 条消息，请向上滑动查找`,
-              show_alert: true,
-            }),
-          }
-        );
-      } else {
-        // 普通群组或其他情况：回退到提示
-        await fetch(
-          `https://api.telegram.org/bot${config.telegram.botToken}/answerCallbackQuery`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ 
-              callback_query_id: callbackQuery.id,
-              text: "↩️ 请向上滑动查找摘要消息",
-              show_alert: true,
-            }),
-          }
-        );
-      }
-    } else {
-      await fetch(
-        `https://api.telegram.org/bot${config.telegram.botToken}/answerCallbackQuery`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ 
-            callback_query_id: callbackQuery.id,
-            text: "↩️ 请向上滑动查找摘要消息",
-            show_alert: true,
-          }),
-        }
-      );
-    }
+    );
+    return;
+
   } else {
     // 未知回调，应答避免 Telegram 显示"无效操作"
     await fetch(
@@ -1457,9 +1632,10 @@ serve({
       return Response.json({ error: "Not found" }, { status: 404, headers });
     }
 
-    // API: 翻译
+    // API: 翻译（支持 ?force=true 强制重新翻译）
     if (path.startsWith("/api/translate/") && req.method === "POST") {
-      const id = path.replace("/api/translate/", "");
+      const id = path.replace("/api/translate/", "").split("?")[0];
+      const forceRetranslate = url.searchParams.get("force") === "true";
       const articles = loadJSON<Record<string, Article>>(ARTICLES_FILE, {});
       const article = articles[id];
       const cfg = loadJSON<Config>(CONFIG_FILE, DEFAULT_CONFIG);
@@ -1468,12 +1644,69 @@ serve({
         return Response.json({ error: "Not found" }, { status: 404, headers });
       }
 
-      if (!article.translatedContent) {
-        article.translatedContent = await translateFullText(cfg, article.content);
+      if (!article.translatedContent || forceRetranslate) {
+        log(`📖 ${forceRetranslate ? "强制重新" : ""}翻译文章: ${article.titleZh}`);
+        
+        // 检查本地内容是否足够，不足则从网页抓取
+        let contentToTranslate = article.content;
+        const cleanedLocal = cleanContentForTranslation(contentToTranslate);
+        
+        if (cleanedLocal.length < 500) {
+          log(`📄 本地内容太短(${cleanedLocal.length}字符)，从原文链接抓取...`);
+          const fetchedContent = await fetchArticleContent(article.link);
+          if (fetchedContent.length > cleanedLocal.length) {
+            contentToTranslate = fetchedContent;
+            article.content = fetchedContent;
+            log(`📄 抓取成功，内容长度: ${fetchedContent.length}`);
+          }
+        }
+        
+        article.translatedContent = await translateFullText(cfg, contentToTranslate);
         saveJSON(ARTICLES_FILE, articles);
       }
 
       return Response.json({ content: article.translatedContent }, { headers });
+    }
+
+    // API: 清除文章翻译缓存
+    if (path.startsWith("/api/article/") && path.endsWith("/clear-translation") && req.method === "POST") {
+      if (!isAuthenticated(req)) {
+        return Response.json({ error: "未授权访问" }, { status: 401, headers });
+      }
+      const id = path.replace("/api/article/", "").replace("/clear-translation", "");
+      const articles = loadJSON<Record<string, Article>>(ARTICLES_FILE, {});
+      const article = articles[id];
+
+      if (!article) {
+        return Response.json({ error: "Not found" }, { status: 404, headers });
+      }
+
+      article.translatedContent = null;
+      article.content = "";  // 同时清空本地内容，强制重新抓取
+      saveJSON(ARTICLES_FILE, articles);
+      log(`🗑️ 已清除文章翻译缓存: ${article.titleZh}`);
+
+      return Response.json({ success: true, message: "翻译缓存已清除" }, { headers });
+    }
+
+    // API: 清除所有翻译缓存
+    if (path === "/api/articles/clear-all-translations" && req.method === "POST") {
+      if (!isAuthenticated(req)) {
+        return Response.json({ error: "未授权访问" }, { status: 401, headers });
+      }
+      const articles = loadJSON<Record<string, Article>>(ARTICLES_FILE, {});
+      let count = 0;
+      for (const id in articles) {
+        if (articles[id].translatedContent) {
+          articles[id].translatedContent = null;
+          articles[id].content = "";  // 强制下次重新抓取
+          count++;
+        }
+      }
+      saveJSON(ARTICLES_FILE, articles);
+      log(`🗑️ 已清除所有翻译缓存，共 ${count} 篇`);
+
+      return Response.json({ success: true, message: `已清除 ${count} 篇文章的翻译缓存` }, { headers });
     }
 
     // Telegram Webhook
